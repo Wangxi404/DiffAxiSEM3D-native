@@ -21,7 +21,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch
 
-from .case import CASE, load_case
+from .case import CASE, load_case, simulation_mask
 from .native import NativeSolver
 from .objective import SoftDTW, TensorMisfit
 from .plotting import render
@@ -215,14 +215,13 @@ def run(args, parser):
             fingerprint.hexdigest(),
         )
     path = args.output / "models.npz"
-    inside = fields["x"][:, None, None] ** 2 + fields["y"][None, :, None] ** 2 <= 1e8
     np.savez_compressed(
         path,
         **{k: fields[k] for k in ("x", "y", "depth", "true", "initial")},
         inverted=model,
         loss=loss,
         accepted_update=len(loss) - 1,
-        display_mask=np.broadcast_to(inside, model.shape),
+        display_mask=simulation_mask(fields),
     )
     render(path, args.output)
     print(args.output / "model-recovery.html")

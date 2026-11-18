@@ -1,11 +1,11 @@
 # DiffAxiSEM3D-native
 
-DiffAxiSEM3D-native is the 3D inversion software we distribute alongside the
-`differentiate-seismic-solver` skill. Run the salt inversion below or supply
-your own waveform misfit. PyTorch computes the adjoint source from receiver
-traces. The native AxiSEM3D C++/MPI solver propagates the forward and adjoint
-wavefields to compute the Vp gradient.
-[SKILL](https://github.com/Wangxi404/differentiate-seismic-solver) ·
+We developed DiffAxiSEM3D-native with SeismicDiffSkill, a reusable Agent Skill
+for adapting seismic solvers for differentiable inversion. Run the salt
+inversion below or supply your own waveform misfit. PyTorch computes the
+adjoint source from receiver traces. The native AxiSEM3D C++/MPI solver
+propagates the forward and adjoint wavefields to compute the Vp gradient.
+[Agent Skill](https://github.com/Wangxi404/differentiate-seismic-solver) ·
 [Upstream AxiSEM3D](https://github.com/AxiSEMunity/AxiSEM3D)
 
 ## SEG/EAGE 3D salt inversion
@@ -14,6 +14,7 @@ This **float64, 3D isotropic elastic** simulation propagates P and S waves.
 Each update uses all 9 shots at the same model, with radial, azimuthal and
 vertical displacement recorded at 169 receivers. We invert Vp on a 33 × 33 × 17
 grid from a Gaussian-smoothed initial model, holding Vs and density fixed.
+The optimizer constrains Vp to 1.45–4.70 km/s.
 
 After 125 updates, the **debiased soft-DTW divergence** (float64, γ = 0.1)
 fell from **0.00304 to 0.000423**. Vp RMSE within the simulated cylinder

@@ -21,6 +21,16 @@ def load_case():
     return case, fields
 
 
+def simulation_mask(fields):
+    """Select control points inside the cylindrical salt mesh."""
+    with netCDF4.Dataset(CASE / "input" / "mesh.e") as mesh:
+        radius = float(np.max(mesh.variables["coordx"][:]))
+        mesh_depth = float(np.ptp(mesh.variables["coordy"][:]))
+    in_disk = fields["x"][:, None, None] ** 2 + fields["y"][None, :, None] ** 2 <= radius**2
+    depth = fields["depth"][None, None, :]
+    return in_disk & (depth >= 0) & (depth <= mesh_depth)
+
+
 def write_material(path, fields, vp):
     axes = ("x", "y", "depth")
     with netCDF4.Dataset(path, "w", format="NETCDF3_64BIT_OFFSET") as nc:
