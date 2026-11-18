@@ -1,0 +1,7 @@
+wavefield_scanning:
+  enable_scanning: false
+type_Nr: "POINTWISE"
+bound_Nr_by_inplane: false
+pointwise:
+  nc_data_file: "nr.nc"
+  multip_factor: 1.0

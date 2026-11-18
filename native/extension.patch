@@ -1,0 +1,645 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -132,7 +132,7 @@
+   cmake_policy(SET CMP0167 NEW)
+ endif()
+ set(BOOST_DIR "$ENV{BOOST_DIR}" CACHE PATH "An optional hint to a Boost installation")
+-find_package(Boost 1.83 REQUIRED HINTS ${BOOST_DIR})
++find_package(Boost 1.82 REQUIRED HINTS ${BOOST_DIR})
+ include_directories(${Boost_INCLUDE_DIRS})
+ 
+ # FFTW3 (optional prefix: -DFFTW3_DIR= or env FFTW3_DIR; legacy -Dfftw= still accepted)
+--- a/src/core/boundary/ABC/AbsorbingBoundary.hpp
++++ b/src/core/boundary/ABC/AbsorbingBoundary.hpp
+@@ -25,6 +25,7 @@
+ class Messaging;
+ 
+ class AbsorbingBoundary {
++  friend class NativeDiff;
+   public:
+   // add Clayton in solid
+   void
+--- /dev/null
++++ b/src/core/diff/NativeDiff.cpp
+@@ -0,0 +1,315 @@
++// Scope: isotropic unattenuated solid; fixed mass, geometry and boundaries;
++// no PRT, no absorbing boundary. Native axis projector and MPI are transposed.
++#include "NativeDiff.hpp"
++#include "Domain.hpp"
++#include "SolidPoint.hpp"
++#include "SolidElement.hpp"
++#include "FluidPoint.hpp"
++#include "StationGroup.hpp"
++#include "AxialBoundary.hpp"
++#include "AbsorbingBoundary.hpp"
++#include "fft.hpp"
++#include "mpi.hpp"
++#include <cstdlib>
++#include <iomanip>
++#include <stdexcept>
++#include <cmath>
++#include <chrono>
++
++namespace {
++void ensure(bool ok, const std::string& what) {
++  if (!ok) throw std::runtime_error("NativeDiff: " + what);
++}
++std::string rankPrefix(const std::string& p) {
++  return p + ".rank" + std::to_string(mpi::rank());
++}
++}
++
++NativeDiff::NativeDiff(const Domain& domain, double t0, double dt, int nt) :
++ mDomain(domain), mT0(t0), mDt(dt), mNt(nt) {
++  const char* mode = std::getenv("AXISEM_DIFF_MODE");
++  if (!mode || !*mode) return;
++  mMode = mode;
++  ensure(mMode == "forward" || mMode == "record" || mMode == "adjoint", "unknown mode");
++  const char* prefix = std::getenv("AXISEM_DIFF_PREFIX");
++  ensure(prefix && *prefix, "AXISEM_DIFF_PREFIX required");
++  mPrefix = rankPrefix(prefix);
++  ensure(domain.mFluidPoints.empty() && domain.mFluidElements.empty(), "only solid supported");
++  const auto& abc=*domain.mAbsorbingBoundary;
++  ensure(abc.mClaytonSolids.empty() && abc.mClaytonFluids.empty() &&
++         abc.mSpongeSolids.empty() && abc.mSpongeFluids.empty(), "absorbing boundaries unsupported");
++  for(const auto& p:domain.mSolidPoints)
++    ensure(p->typeInfo().find("Mass1D")!=std::string::npos,"fixed 1D mass required");
++  ensure(!domain.mWavefieldInjection, "wavefield injection unsupported");
++  ensure(domain.mStationGroupInSolids.size() == 1, "exactly one station group required");
++  const auto& group = *domain.mStationGroupInSolids[0];
++  ensure(group.mSampleIntv == 1, "all-step samples required");
++  ensure(group.mChannelOptions.mWCS == channel::WavefieldCS::spz, "SPZ coordinates required");
++  const auto& chans=group.mChannelOptions.mStdChannels;
++  ensure(chans.size()==3, "three displacement channels required");
++  for(int i=0;i<3;i++) {
++    const auto& c=channel::solid::gChannelMap.at(chans[i]);
++    ensure(std::get<2>(c)==channel::solid::FieldType::Displ && std::get<3>(c)==i,
++           "channels must be U1,U2,U3 in that order");
++  }
++  for (const auto& st : group.mStations) mStations.push_back(st.get());
++  for (const auto& e : domain.mSolidElements) {
++    ensure(!e->mElastic->mAttenuation, "attenuation unsupported");
++    ensure(!e->mPRT, "PRT unsupported");
++    ensure(e->typeInfo().find("Isotropic")!=std::string::npos, "isotropic material required");
++    ensure(e->getNr()%2==1, "odd Nr required in this scoped adapter");
++    mElemOffsets.push_back(mFrameValues);
++    mFrameValues += size_t(e->getNr()) * spectral::nPEM;
++  }
++  mFrame.resize(mFrameValues);
++  if (std::getenv("AXISEM_DIFF_DOT_TEST") || std::getenv("AXISEM_DIFF_DIAGNOSTICS")) {
++    const auto& pp=domain.mSolidPoints;
++    std::vector<eigen::CMatX3> x,y,bt;
++    for(const auto& p:pp) {
++      eigen::CMatX3 a(p->getNu_1(),3),b(p->getNu_1(),3);
++      for(int k=0;k<a.rows();k++)for(int d=0;d<3;d++) {
++        double z=.071*(1+p->getMeshTag())+.17*k+.31*d;
++        a(k,d)=numerical::ComplexR(std::sin(z),k?std::cos(1.3*z):0.);
++        b(k,d)=numerical::ComplexR(std::cos(.7*z),k?std::sin(1.9*z):0.);
++      }
++      x.push_back(a);y.push_back(b);bt.push_back(eigen::CMatX3::Zero(a.rows(),3));
++      p->getFields().mDispl=a;p->getFields().mStiff.setZero();
++    }
++    std::vector<double> ds(mStations.size()*3),ct(ds.size());
++    for(size_t i=0;i<ct.size();i++)ct[i]=std::sin(.139*(i+1+13*mpi::rank()));
++    sample(ds.data());sampleTranspose(ct.data(),bt);
++    double sl=0.,sr=0.;for(size_t j=0;j<ds.size();j++)sl+=ds[j]*ct[j];
++    for(size_t i=0;i<pp.size();i++)for(int a=0;a<x[i].rows();a++)for(int d=0;d<3;d++)
++      sr+=(a?2.:1.)*std::real(std::conj(x[i](a,d))*bt[i](a,d));
++    sl=mpi::sum(sl);sr=mpi::sum(sr);
++    double pl=0.,pr=0.;
++    for(size_t i=0;i<pp.size();i++) {
++      pp[i]->getFields().mStiff=x[i];
++      if(std::abs(pp[i]->getCoords()(0))>1.e-7)pp[i]->getFields().mStiff.setZero();
++    }
++    domain.mAxialBoundary->apply();
++    for(size_t i=0;i<pp.size();i++) {
++      for(int a=0;a<x[i].rows();a++)for(int d=0;d<3;d++)
++        pl+=(a?2.:1.)*std::real(std::conj(y[i](a,d))*pp[i]->getFields().mStiff(a,d));
++      pp[i]->getFields().mStiff=y[i];
++      if(std::abs(pp[i]->getCoords()(0))>1.e-7)pp[i]->getFields().mStiff.setZero();
++    }
++    domain.mAxialBoundary->apply();
++    for(size_t i=0;i<pp.size();i++) {
++      for(int a=0;a<x[i].rows();a++)for(int d=0;d<3;d++)
++        pr+=(a?2.:1.)*std::real(std::conj(x[i](a,d))*pp[i]->getFields().mStiff(a,d));
++      pp[i]->getFields().mDispl=x[i];pp[i]->getFields().mStiff.setZero();
++    }
++    pl=mpi::sum(pl);pr=mpi::sum(pr);
++    domain.computeStiffness();
++    double kl=0.,kr=0.;
++    for(size_t i=0;i<pp.size();i++) {
++      for(int a=0;a<x[i].rows();a++)for(int d=0;d<3;d++)
++        kl+=(a?2.:1.)*std::real(std::conj(y[i](a,d))*pp[i]->getFields().mStiff(a,d));
++      pp[i]->getFields().mDispl=y[i];pp[i]->getFields().mStiff.setZero();
++    }
++    domain.computeStiffness();
++    for(size_t i=0;i<pp.size();i++) {
++      for(int a=0;a<x[i].rows();a++)for(int d=0;d<3;d++)
++        kr+=(a?2.:1.)*std::real(std::conj(x[i](a,d))*pp[i]->getFields().mStiff(a,d));
++      pp[i]->resetToZero();
++    }
++    kl=mpi::sum(kl);kr=mpi::sum(kr);
++    if(mpi::root()) {
++      std::ofstream diag(mPrefix+".dots.json");
++      diag<<std::setprecision(17)<<"{\"sampling\":{\"left\":"<<sl<<",\"right\":"<<sr
++        <<",\"relative_error\":"<<std::abs(sl-sr)/std::max(std::abs(sl),std::abs(sr))
++        <<"},\"axial_projector\":{\"left\":"<<pl<<",\"right\":"<<pr
++        <<",\"relative_error\":"<<std::abs(pl-pr)/std::max(std::abs(pl),std::abs(pr))
++        <<"},\"native_local_stiffness\":{\"left\":"<<kl<<",\"right\":"<<kr
++        <<",\"relative_error\":"<<std::abs(kl-kr)/std::max(std::abs(kl),std::abs(kr))<<"}}";
++    }
++  }
++  if (mMode != "adjoint") {
++    mData.resize(size_t(nt)*mStations.size()*3);
++    if(mMode=="record") {
++      mHistory.open(mPrefix+".history.bin", std::ios::binary|std::ios::out|std::ios::trunc);
++      ensure(mHistory.good(), "cannot create history");
++    }
++    std::ofstream meta(mPrefix+".stations.json");
++    meta << std::setprecision(17) << "{\"schema\":\"native-diff-stations-v1\",\"nt\":"<<nt
++      <<",\"t0\":"<<t0<<",\"time0\":"<<t0<<",\"nstations\":"<<mStations.size()<<",\"components\":[\"S\",\"P\",\"Z\"],\"dt\":"<<dt<<",\"shape\":["<<nt<<","<<mStations.size()
++      <<",3],\"dtype\":\"<f8\",\"order\":\"time,station,SPZ\",\"keys\":[";
++    for(size_t i=0;i<mStations.size();i++) { if(i)meta<<",";meta<<"\""<<mStations[i]->getKey()<<"\""; }
++    meta<<"]}";
++  }
++  sActive=this;
++}
++NativeDiff::~NativeDiff() {
++  if(sActive==this)sActive=nullptr;
++  if(mHistory.is_open())mHistory.close();
++}
++
++void NativeDiff::captureStrain(const SolidElement& e, bool inFourier) {
++  if(!sActive || !sActive->mCaptureBuffer)return;
++  auto& self=*sActive;auto phase=std::chrono::steady_clock::now();
++  if(inFourier)fft::gFFT_N6.computeC2R(SolidElement::sStrainUndulated_FR,
++                                     SolidElement::sStrainUndulated_CD,e.mNr);
++  const size_t off=self.mElemOffsets.at(e.getDomainTag());
++  for(int r=0;r<e.mNr;r++)for(int p=0;p<spectral::nPEM;p++)
++    self.mCaptureBuffer[off+size_t(r)*spectral::nPEM+p]=double(
++      SolidElement::sStrainUndulated_CD(r,p)+
++      SolidElement::sStrainUndulated_CD(r,spectral::nPEM+p)+
++      SolidElement::sStrainUndulated_CD(r,2*spectral::nPEM+p));
++  self.mCapturedElements++;
++  self.mDivergenceSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-phase).count();
++}
++
++void NativeDiff::divergence(const SolidElement& e, double* out) {
++  // Exactly the native cylindrical strain map. The trace is coordinate invariant.
++  e.collectDisplFromPoints(SolidElement::sDisplSpherical_FR);
++  e.mGradQuad->computeGrad6(SolidElement::sDisplSpherical_FR,
++                          SolidElement::sStrainUndulated_FR,e.mNu_1);
++  fft::gFFT_N6.computeC2R(SolidElement::sStrainUndulated_FR,
++                        SolidElement::sStrainUndulated_CD,e.mNr);
++  for(int r=0;r<e.mNr;r++)for(int p=0;p<spectral::nPEM;p++)
++    out[size_t(r)*spectral::nPEM+p] = double(SolidElement::sStrainUndulated_CD(r,p)+
++      SolidElement::sStrainUndulated_CD(r,spectral::nPEM+p)+
++      SolidElement::sStrainUndulated_CD(r,2*spectral::nPEM+p));
++}
++void NativeDiff::sample(double* out) const {
++  for(size_t s=0;s<mStations.size();s++) {
++    const auto& st=*mStations[s];
++    const auto& e=*st.mElement;
++    for(int d=0;d<3;d++) {
++      double value=0.;
++      for(int a=0;a<e.mNu_1;a++) {
++        numerical::ComplexR u=0.;
++        for(size_t j=0;j<st.mNonZeroIndices.size();j++) {
++          const auto& p=*e.mPoints[st.mNonZeroIndices[j]];
++          if(a<p.getNu_1()) u+=st.mNonZeroWeights(j)*p.getFields().mDispl(a,d);
++        }
++        value += (a==0?1.:2.)*std::real(u*std::exp(numerical::ComplexR(0.,a*st.mPhi)));
++      }
++      out[s*3+d]=value;
++    }
++  }
++}
++void NativeDiff::sampleTranspose(const double* cot,std::vector<eigen::CMatX3>& bu) const {
++  // Cotangents are represented under H=diag(1,2,2,...) real Fourier metric.
++  // Thus C^T/H uses exp(-i*a*phi), with no extra factor two.
++  for(size_t s=0;s<mStations.size();s++) {
++    const auto& st=*mStations[s]; const auto& e=*st.mElement;
++    for(size_t j=0;j<st.mNonZeroIndices.size();j++) {
++      const auto& p=*e.mPoints[st.mNonZeroIndices[j]];
++      auto& b=bu[p.getDomainTag()];
++      for(int a=0;a<p.getNu_1();a++) {
++        auto w=st.mNonZeroWeights(j)*std::exp(numerical::ComplexR(0.,-a*st.mPhi));
++        for(int d=0;d<3;d++)b(a,d)+=w*cot[s*3+d];
++      }
++    }
++  }
++}
++void NativeDiff::record(int n) {
++  if(mMode.empty()||mMode=="adjoint")return;
++  auto phase=std::chrono::steady_clock::now();
++  sample(mData.data()+size_t(n)*mStations.size()*3);
++  mSamplingSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-phase).count();
++  if(mMode=="record") { mCaptureBuffer=mFrame.data();mCapturedElements=0; }
++}
++void NativeDiff::afterStiffness(int) {
++  if(mMode!="record")return;
++  mCaptureBuffer=nullptr;
++  ensure(mCapturedElements==mDomain.mSolidElements.size(),"native strain capture count mismatch");
++  auto phase=std::chrono::steady_clock::now();
++  mHistory.write(reinterpret_cast<const char*>(mFrame.data()),mFrameValues*sizeof(double));
++  ensure(mHistory.good(),"history write failed");
++  mHistoryWriteSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-phase).count();
++}
++void NativeDiff::finish() {
++  if(mFinished||mMode.empty()||mMode=="adjoint")return;
++  if(mHistory.is_open())mHistory.close();
++  std::ofstream data(mPrefix+".data.bin",std::ios::binary|std::ios::trunc);
++  data.write(reinterpret_cast<const char*>(mData.data()),mData.size()*sizeof(double));
++  ensure(data.good(),"data write failed");
++  std::ofstream meta(mPrefix+".history.json");
++  meta<<"{\"scope\":\"Vp-only lambda sensitivity\",\"policy\":\"exact full divergence history on disk\",\"nt\":"
++    <<mNt<<",\"values_per_frame\":"<<mFrameValues<<",\"bytes\":"
++    <<(mMode=="record"?size_t(mNt)*mFrameValues*sizeof(double):0)
++    <<",\"sampling_wall_s\":"<<mSamplingSeconds<<",\"divergence_wall_s\":"<<mDivergenceSeconds
++    <<",\"history_write_wall_s\":"<<mHistoryWriteSeconds<<"}";
++  mFinished=true;
++}
++
++void NativeDiff::solveAdjoint() {
++  const auto start=std::chrono::steady_clock::now();
++  const auto& points=mDomain.mSolidPoints;
++  std::vector<eigen::CMatX3> bu,bv,ba;
++  for(const auto& p:points) {
++    auto z=eigen::CMatX3::Zero(p->getNu_1(),3).eval();
++    bu.push_back(z);bv.push_back(z);ba.push_back(z);
++    p->resetToZero();
++  }
++  std::vector<double> cot(size_t(mNt)*mStations.size()*3),gradient(mFrameValues,0.),adjdiv(mFrameValues);
++  std::ifstream cf(mPrefix+".cot.bin",std::ios::binary);
++  cf.read(reinterpret_cast<char*>(cot.data()),cot.size()*sizeof(double));
++  ensure(cf.good()||(!cot.size()&&cf.is_open()),"cotangent file missing/truncated");
++  mHistory.open(mPrefix+".history.bin",std::ios::binary|std::ios::in);
++  ensure(mHistory.good(),"history missing");
++  std::ifstream hmeta(mPrefix+".history.json");
++  ensure(hmeta.good(),"history metadata missing");
++  const double halfdt=.5*mDt,halfdt2=.5*mDt*mDt;
++  for(int n=mNt-1;n>=0;n--) {
++    // Literal reverse of native Newmark update. No reverse-time approximation.
++    for(size_t i=0;i<points.size();i++) {
++      bv[i]+=mDt*bu[i];
++      auto& f=points[i]->getFields();
++      f.mStiff=ba[i]+halfdt2*bu[i]+halfdt*bv[i];
++      ba[i]=halfdt*bv[i];
++      // Uniform fixed mass is self-adjoint in H. Reverse Nyquist follows mass.
++      points[i]->mMass->computeAccel(f.mStiff);
++      if(points[i]->getNr()%2==0)f.mStiff.bottomRows(1).imag().setZero();
++    }
++    // Native axial masking is an orthogonal Hermitian projector, hence P^T=P.
++    mDomain.mAxialBoundary->apply();
++    // Transpose of replicated interface sum is the same all-copy sum.
++    // This is BEFORE element transpose; no second assembly after local K^T.
++    mDomain.mpiGatherSendRecv(); mDomain.mpiWaitScatter();
++    for(const auto& p:points) {
++      auto& f=p->getFields();f.mDispl=f.mStiff;f.mStiff.setZero();
++    }
++    // Native K computes the exact strain once; capture it before constitutive use.
++    // Its stiffness result is retained for the local transpose accumulation below.
++    mCaptureBuffer=adjdiv.data();mCapturedElements=0;
++    mDomain.computeStiffness();
++    mCaptureBuffer=nullptr;
++    ensure(mCapturedElements==mDomain.mSolidElements.size(),"adjoint strain capture count mismatch");
++    mHistory.seekg(std::streamoff(size_t(n)*mFrameValues*sizeof(double)));
++    mHistory.read(reinterpret_cast<char*>(mFrame.data()),mFrameValues*sizeof(double));
++    ensure(mHistory.good(),"history read failed");
++    for(size_t i=0;i<mDomain.mSolidElements.size();i++) {
++      const auto& e=*mDomain.mSolidElements[i];const auto& w=e.mGradQuad->diffIntegralFactor();
++      const size_t off=mElemOffsets[i];
++      // Parseval: <x,y>_H=(1/Nr) sum_phi x(phi)y(phi). Native stiffness has -K.
++      for(int r=0;r<e.getNr();r++)for(int p=0;p<spectral::nPEM;p++) {
++        const size_t j=off+size_t(r)*spectral::nPEM+p;
++        gradient[j]-=mFrame[j]*adjdiv[j]*double(w(p/spectral::nPED,p%spectral::nPED))/e.getNr();
++      }
++    }
++    for(size_t i=0;i<points.size();i++) {
++      bu[i]+=points[i]->getFields().mStiff;
++      points[i]->getFields().mStiff.setZero();
++    }
++    sampleTranspose(cot.data()+size_t(n)*mStations.size()*3,bu);
++  }
++  mHistory.close();
++  std::ofstream gf(mPrefix+".lambda.bin",std::ios::binary|std::ios::trunc);
++  gf.write(reinterpret_cast<const char*>(gradient.data()),gradient.size()*sizeof(double));
++  ensure(gf.good(),"lambda gradient write failed");
++  std::ofstream meta(mPrefix+".lambda.jsonl");
++  for(size_t i=0;i<mDomain.mSolidElements.size();i++) {
++    const auto& e=*mDomain.mSolidElements[i];
++    meta<<"{\"qtag\":"<<e.getQuadTag()<<",\"nr\":"<<e.getNr()
++      <<",\"npem\":"<<spectral::nPEM<<",\"offset_f64\":"<<mElemOffsets[i]
++      <<",\"order\":\"row-major Nr,nPEM\",\"meaning\":\"dJ/dlambda cardinal; includes quadrature and all time factors\"}\n";
++  }
++  std::ofstream perf(mPrefix+".adjoint.json");
++  perf<<std::setprecision(17)<<"{\"native_adjoint\":true,\"temporal_AD\":false,\"parameter_FD\":false,\"reverse_steps\":"
++    <<mNt<<",\"forward_replays\":0,\"history_read_bytes\":"<<size_t(mNt)*mFrameValues*sizeof(double)
++    <<",\"wall_s\":"<<std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()<<"}";
++}
+--- /dev/null
++++ b/src/core/diff/NativeDiff.hpp
+@@ -0,0 +1,41 @@
++#ifndef NativeDiff_hpp
++#define NativeDiff_hpp
++#include "eigen_element.hpp"
++#include "eigen_point.hpp"
++#include <string>
++#include <vector>
++#include <fstream>
++class Domain;
++class SolidElement;
++class StationSolid;
++class NativeDiff {
++ public:
++  NativeDiff(const Domain& domain, double t0, double dt, int nt);
++  ~NativeDiff();
++  bool isAdjoint() const { return mMode == "adjoint"; }
++  void record(int n);
++  void afterStiffness(int n);
++  // Observer of an already computed native strain; never changes it.
++  static void captureStrain(const SolidElement& element, bool inFourier);
++  void finish();
++  void solveAdjoint();
++ private:
++  void divergence(const SolidElement& e, double* out);
++  void sample(double* out) const;
++  void sampleTranspose(const double* cot, std::vector<eigen::CMatX3>& bu) const;
++  const Domain& mDomain;
++  double mT0, mDt;
++  int mNt;
++  std::string mMode, mPrefix;
++  std::vector<const StationSolid*> mStations;
++  std::vector<size_t> mElemOffsets;
++  size_t mFrameValues = 0;
++  std::vector<double> mFrame, mData;
++  std::fstream mHistory;
++  bool mFinished = false;
++  double mSamplingSeconds=0.,mDivergenceSeconds=0.,mHistoryWriteSeconds=0.;
++  inline static NativeDiff* sActive=nullptr;
++  double* mCaptureBuffer=nullptr;
++  size_t mCapturedElements=0;
++};
++#endif
+--- a/src/core/domain/Domain.hpp
++++ b/src/core/domain/Domain.hpp
+@@ -52,6 +52,7 @@
+ class WavefieldScanning;
+ 
+ class Domain {
++  friend class NativeDiff;
+   public:
+   // constructor
+   Domain();
+--- a/src/core/element/SolidElement.cpp
++++ b/src/core/element/SolidElement.cpp
+@@ -10,6 +10,8 @@
+ //  solid spectral element
+ 
+ #include "SolidElement.hpp"
++#include "NativeDiff.hpp"
++#include <cstdlib>
+ #include "SolidPoint.hpp"
+ #include "fft.hpp"
+ // output
+@@ -59,6 +61,9 @@
+   if (sStrainSpherical_CD.rows() < mNr) {
+     expandWorkspace(mNr);
+   }
++
++  // Derivative extension: divergence history uses native N6 transforms.
++  if (std::getenv("AXISEM_DIFF_MODE")) { fft::gFFT_N6.addNR(mNr); }
+ 
+   // report request to FFT
+   if (!mInFourier) {
+@@ -156,9 +161,11 @@
+ 
+     // strain to stress
+     if (mInFourier) {
++      NativeDiff::captureStrain(*this, true);
+       mElastic->strainToStress_FR(sStrainUndulated_FR, sStressUndulated_FR, mNu_1);
+     } else {
+       fft::gFFT_N6.computeC2R(sStrainUndulated_FR, sStrainUndulated_CD, mNr);
++      NativeDiff::captureStrain(*this, false);
+       mElastic->strainToStress_CD(sStrainUndulated_CD, sStressUndulated_CD, mNr);
+       fft::gFFT_N6.computeR2C(sStressUndulated_CD, sStressUndulated_FR, mNr);
+     }
+--- a/src/core/element/SolidElement.hpp
++++ b/src/core/element/SolidElement.hpp
+@@ -25,6 +25,7 @@
+ #include "channel.hpp"
+ 
+ class SolidElement : public Element {
++  friend class NativeDiff;
+   public:
+   // constructor
+   SolidElement(int quadTag,
+--- a/src/core/element/grad/GradientQuadrature.hpp
++++ b/src/core/element/grad/GradientQuadrature.hpp
+@@ -91,8 +91,11 @@
+   const RMatPP_RM m1overS_IF;
+ #endif
+ 
++  const RMatPP_RM mDiffIntegralFactor;
++
+   /////////////////////////// methods ///////////////////////////
+   public:
++  const RMatPP_RM& diffIntegralFactor() const { return mDiffIntegralFactor; }
+ #ifdef AXISEM3D_SAVE_MEMORY
+   // constructor
+   GradientQuadrature(const eigen::DMatPP_RM& dsdxii,
+@@ -105,7 +108,7 @@
+       mDsDxii(dsdxii.cast<floatT>()), mDsDeta(dsdeta.cast<floatT>()),
+       mDzDxii(dzdxii.cast<floatT>()), mDzDeta(dzdeta.cast<floatT>()),
+       m1overS(_1ovrS.cast<floatT>()), mAxial(axial),
+-      mIntegralFactor(integralFactor.cast<floatT>()) {
++      mIntegralFactor(integralFactor.cast<floatT>()), mDiffIntegralFactor(integralFactor.cast<floatT>()) {
+     // nothing
+   }
+ 
+@@ -113,7 +116,7 @@
+   GradientQuadrature(const GradientQuadrature& other) :
+       mDsDxii(other.mDsDxii), mDsDeta(other.mDsDeta), mDzDxii(other.mDzDxii),
+       mDzDeta(other.mDzDeta), m1overS(other.m1overS), mAxial(other.mAxial),
+-      mIntegralFactor(other.mIntegralFactor) {
++      mIntegralFactor(other.mIntegralFactor), mDiffIntegralFactor(other.mDiffIntegralFactor) {
+     // nothing
+   }
+ #else
+@@ -132,7 +135,8 @@
+       mDsDeta_IF((dsdeta.cwiseProduct(integralFactor)).cast<floatT>()),
+       mDzDxii_IF((dzdxii.cwiseProduct(integralFactor)).cast<floatT>()),
+       mDzDeta_IF((dzdeta.cwiseProduct(integralFactor)).cast<floatT>()),
+-      m1overS_IF((_1ovrS.cwiseProduct(integralFactor)).cast<floatT>()) {
++      m1overS_IF((_1ovrS.cwiseProduct(integralFactor)).cast<floatT>()),
++      mDiffIntegralFactor(integralFactor.cast<floatT>()) {
+     // nothing
+   }
+ 
+@@ -141,7 +145,7 @@
+       mDsDxii(other.mDsDxii), mDsDeta(other.mDsDeta), mDzDxii(other.mDzDxii),
+       mDzDeta(other.mDzDeta), m1overS(other.m1overS), mAxial(other.mAxial),
+       mDsDxii_IF(other.mDsDxii_IF), mDsDeta_IF(other.mDsDeta_IF), mDzDxii_IF(other.mDzDxii_IF),
+-      mDzDeta_IF(other.mDzDeta_IF), m1overS_IF(other.m1overS_IF) {
++      mDzDeta_IF(other.mDzDeta_IF), m1overS_IF(other.m1overS_IF), mDiffIntegralFactor(other.mDiffIntegralFactor) {
+     // nothing
+   }
+ #endif
+--- a/src/core/element/material/elastic/Elastic.hpp
++++ b/src/core/element/material/elastic/Elastic.hpp
+@@ -15,6 +15,7 @@
+ #include "Attenuation.hpp"
+ 
+ class Elastic {
++  friend class NativeDiff;
+   public:
+   // constructor
+   Elastic(bool is1D, std::unique_ptr<Attenuation>& attenuation) :
+--- a/src/core/output/station-wise/station/Station.hpp
++++ b/src/core/output/station-wise/station/Station.hpp
+@@ -20,6 +20,7 @@
+ #define bblk(dim) block(0, dim, bufferLine, 1)
+ 
+ class Station {
++  friend class NativeDiff;
+   public:
+   // constructor
+   Station(const std::string& key, double phi, double theta, double backAzimuth) :
+--- a/src/core/output/station-wise/station/StationGroup.hpp
++++ b/src/core/output/station-wise/station/StationGroup.hpp
+@@ -31,6 +31,7 @@
+ 
+ ///////////////////// station group /////////////////////
+ template <class StationT> class StationGroup {
++  friend class NativeDiff;
+   public:
+   // constructor
+   StationGroup(const std::string& groupName,
+--- a/src/core/output/station-wise/station/StationSolid.hpp
++++ b/src/core/output/station-wise/station/StationSolid.hpp
+@@ -16,6 +16,7 @@
+ class SolidElement;
+ 
+ class StationSolid : public Station {
++  friend class NativeDiff;
+   public:
+   // constructor
+   StationSolid(const std::string& key, double phi, double theta, double backAzimuth) :
+--- a/src/core/point/Point.hpp
++++ b/src/core/point/Point.hpp
+@@ -17,6 +17,7 @@
+ #include "bstring.hpp"
+ 
+ class Point {
++  friend class NativeDiff;
+   public:
+   // constructor
+   Point(int nr, const eigen::DRow2& crds, int meshTag, std::unique_ptr<const Mass>& mass) :
+--- a/src/core/time/NewmarkTimeScheme.cpp
++++ b/src/core/time/NewmarkTimeScheme.cpp
+@@ -10,6 +10,7 @@
+ //  Newmark time scheme
+ 
+ #include "NewmarkTimeScheme.hpp"
++#include "NativeDiff.hpp"
+ #include "SolidPoint.hpp"
+ #include "FluidPoint.hpp"
+ #include "Domain.hpp"
+@@ -18,6 +19,8 @@
+ // solve
+ void
+ NewmarkTimeScheme::solve() const {
++  NativeDiff diff(*mDomain, mT0, mDt, mNumTimeSteps);
++  if (diff.isAdjoint()) { diff.solveAdjoint(); return; }
+   // loop timers
+   std::vector<std::string> timerNames = {"TOTAL",
+       "SOURCE",
+@@ -47,6 +50,7 @@
+ 
+   ////////////////////////// loop //////////////////////////
+   for (int tstep = 0; tstep < mNumTimeSteps; tstep++) {
++    diff.record(tstep);
+     // apply source
+     timers.at("SOURCE").resume();
+     mDomain->applySources(tstep, t);
+@@ -56,6 +60,7 @@
+     timers.at("STIFFNESS").resume();
+     mDomain->computeStiffness();
+     timers.at("STIFFNESS").pause();
++    diff.afterStiffness(tstep);
+ 
+     // boundary conditions before assembling stiffness
+     timers.at("BOUNDARIES").resume();
+@@ -115,6 +120,8 @@
+     t += mDt;
+   } // end of time loop
+ 
++  diff.finish();
++
+   // wavefield output: dump remaining buffers and finalize
+   timers.at("WAVE_OUTPUT").resume();
+   mDomain->dumpOutput();
+--- a/src/preloop/se_model/quad/Quad.cpp
++++ b/src/preloop/se_model/quad/Quad.cpp
+@@ -34,6 +34,10 @@
+ #include "Domain.hpp"
+ #include "SolidElement.hpp"
+ #include "FluidElement.hpp"
++#include "mpi.hpp"
++#include <fstream>
++#include <cstdlib>
++#include <cstdint>
+ 
+ // constructor
+ Quad::Quad(
+@@ -377,6 +381,37 @@
+     domain.addSolidElement(mSolidElement);
+   }
+ 
++  // Export the material coefficients used by each native element.
++  if (const char* prefix = std::getenv("AXISEM_DIFF_PREFIX")) {
++    if (!mFluid && (!std::getenv("AXISEM_DIFF_MODE") || std::string(std::getenv("AXISEM_DIFF_MODE")) != "adjoint")) {
++      const std::string path = std::string(prefix) + ".rank" + std::to_string(mpi::rank()) + ".material.bin";
++      std::ofstream out(path, std::ios::binary | std::ios::app);
++      if (!out) throw std::runtime_error("Cannot open material parity trace: " + path);
++      const auto vp = mMaterial->diffElemental("VP");
++      const auto rho = mMaterial->diffElemental("RHO");
++      const auto vs = mMaterial->diffElemental("VS");
++      const int nr = mPointNr->maxCoeff();
++      const int64_t header[3] = {mGlobalTag, nr, spectral::nPEM};
++      out.write(reinterpret_cast<const char*>(header), sizeof(header));
++      for (int ip = 0; ip < spectral::nPEM; ++ip) {
++        const int64_t n = (*mPointNr)(ip);
++        out.write(reinterpret_cast<const char*>(&n), sizeof(n));
++      }
++      const auto pointSZ = getPointSZ();
++      for (int ip = 0; ip < spectral::nPEM; ++ip) {
++        const double crd[2] = {pointSZ(0,ip), pointSZ(1,ip)};
++        out.write(reinterpret_cast<const char*>(crd), sizeof(crd));
++      }
++      for (int a = 0; a < nr; ++a) for (int ip = 0; ip < spectral::nPEM; ++ip) {
++        const double v = vp(vp.rows()==1 ? 0 : a,ip);
++        const double r = rho(rho.rows()==1 ? 0 : a,ip);
++        const double s = vs(vs.rows()==1 ? 0 : a,ip);
++        const double vals[4] = {v,r,s,r*(v*v-2*s*s)};
++        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
++      }
++    }
++  }
++
+   // free dummy memory
+   mPointNr.reset();
+   mMaterial.reset();
+--- a/src/preloop/se_model/quad/physical/Material.hpp
++++ b/src/preloop/se_model/quad/physical/Material.hpp
+@@ -82,6 +82,10 @@
+   std::unique_ptr<Elastic>
+   createIsotropic(
+       const std::unique_ptr<const AttBuilder>& attBuilder, const eigen::DRow4& weightsCG4) const;
++
++  public:
++  // Coefficients in the native interpolation order.
++  eigen::DMatXN diffElemental(const std::string& key) const { return getElemental(key); }
+ 
+   ////////////////////// property //////////////////////
+   private:

@@ -1,0 +1,23 @@
+list_of_station_groups:
+  -
+    receivers:
+      locations:
+        station_file: "stations.txt"
+        horizontal_x1_x2: "XY_CARTESIAN"
+        vertical_x3: "DEPTH"
+        ellipticity: false
+        depth_below_solid_surface: false
+        undulated_geometry: false
+      wavefields:
+        coordinate_frame: "spz"
+        medium: "SOLID"
+        channels:
+          - "U"
+      temporal:
+        sampling_period: "DT"
+        time_window: "FULL"
+      file_options:
+        format: "NETCDF"
+        buffer_size: 1051
+        flush: false
+list_of_element_groups: []

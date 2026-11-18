@@ -1,0 +1,14 @@
+DiffAxiSEM3D-native
+Copyright (c) 2026 Sid
+
+The native extension targets AxiSEMunity/AxiSEM3D commit
+bc67bb2d76deb2fb208d14dff7b7b25c57d9f35f. See native/LICENSE.AxiSEM3D.
+The data-domain soft-DTW implementation retains its MIT notice in
+diffaxisem3d/LICENSE.soft-dtw.
+
+The salt model and its visualizations derive from the SEG/EAGE 3-D Salt model,
+copyright 1997 Society of Exploration Geophysicists, under CC BY 4.0.
+The velocity volume was filtered and sampled on a 17 × 17 × 9 grid. The initial
+model was Gaussian-smoothed on that grid. Both volumes were then interpolated
+to the 33 × 33 × 17 inversion grid. See examples/salt/DATA_ATTRIBUTION.txt
+and examples/salt/DATA_LICENSE.txt.

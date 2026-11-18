@@ -1,0 +1,29 @@
+time_axis:
+  record_length: 8.0
+  enforced_dt: 0.01
+  Courant_number: 0.5
+  integrator: "NEWMARK"
+list_of_sources:
+  -
+    ${shot}:
+      location:
+        distance_azimuth:
+          - ${radius}
+          - ${azimuth}
+        depth: ${depth}
+        ellipticity: false
+        depth_below_solid_surface: false
+        undulated_geometry: false
+      mechanism:
+        type: "FORCE_VECTOR"
+        data:
+          - 10000000000.0
+          - 0.0
+          - 0.0
+        unit: 1.0
+      source_time_function:
+        class_name: "GaussianSTF"
+        half_duration: 1.0
+        decay_factor: 1.628
+        time_shift: 0.0
+        use_derivative_integral: "RICKER"

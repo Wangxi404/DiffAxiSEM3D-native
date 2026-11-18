@@ -1,0 +1,16 @@
+minimum_jacobian: 0.1
+verbose:
+  channel: "STDOUT"
+  level: "ESSENTIAL"
+  warnings: true
+  loop_info_interval: 200
+  stability_interval: 1
+mpi:
+  nproc_per_group: 1
+  weight_for_load_balancing: "NR"
+  plot_domain_decomposition: true
+develop:
+  diagnose_preloop: true
+  max_num_time_steps: 0
+  time_limit_for_fftw_planning: 0.1
+  fftw_lucky_numbers: false

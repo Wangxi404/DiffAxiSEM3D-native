@@ -1,0 +1,53 @@
+model1D:
+  exodus_mesh: "mesh.e"
+geodesy:
+  lat_lon_north_pole_mesh:
+    - 90.0
+    - 0.0
+  flattening_on_surface: "SPHERE"
+absorbing_boundary:
+  boundaries: []
+  enable_Clayton_Enquist: false
+  Kosloff_Kosloff:
+    enable: false
+attenuation: "NONE"
+list_of_3D_models:
+  -
+    salt:
+      activated: true
+      class_name: "StructuredGridV3D"
+      nc_data_file: "model.nc"
+      coordinates:
+        horizontal: "XY_CARTESIAN"
+        vertical: "DEPTH"
+        ellipticity: false
+        depth_below_solid_surface: false
+        nc_variables:
+          - "x"
+          - "y"
+          - "depth"
+        data_rank:
+          - 0
+          - 1
+          - 2
+        length_unit: "m"
+        angle_unit: "radian"
+        undulated_geometry: false
+        whole_element_inplane: false
+      properties:
+        -
+          VP:
+            nc_var: "VP"
+            factor: 1.0
+            reference_kind: "ABS"
+        -
+          VS:
+            nc_var: "VS"
+            factor: 1.0
+            reference_kind: "ABS"
+        -
+          RHO:
+            nc_var: "RHO"
+            factor: 1.0
+            reference_kind: "ABS"
+      store_grid_only_on_leaders: false
