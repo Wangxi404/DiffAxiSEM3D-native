@@ -1,9 +1,11 @@
 # DiffAxiSEM3D-native
 
-This example uses SeismicDiffSkill to connect native AxiSEM3D propagation to
-differentiable waveform misfits. PyTorch differentiates the misfit with respect
-to receiver traces to form the adjoint source. Forward and adjoint waves
-propagate in C++ with MPI to compute the Vp gradient.
+DiffAxiSEM3D-native is the 3D inversion software we distribute alongside the
+`differentiate-seismic-solver` skill. Run the salt inversion below or supply
+your own waveform misfit. PyTorch computes the adjoint source from receiver
+traces. The native AxiSEM3D C++/MPI solver propagates the forward and adjoint
+wavefields to compute the Vp gradient.
+[SKILL](https://github.com/Wangxi404/differentiate-seismic-solver) ·
 [Upstream AxiSEM3D](https://github.com/AxiSEMunity/AxiSEM3D)
 
 ## SEG/EAGE 3D salt inversion
@@ -18,6 +20,14 @@ fell from **0.00304 to 0.000423**. Vp RMSE within the simulated cylinder
 fell from **201 to 166 m/s**.
 
 ![True, initial and inverted Vp in three central sections, with the survey geometry](docs/example/models.png)
+
+The true model is resampled from the SEG/EAGE 3-D Salt model (Aminzadeh,
+Brac & Kunz, 1997). We smoothed it to form the initial model. Source model
+© 1997 Society of Exploration Geophysicists.
+[SEG dataset](https://wiki.seg.org/wiki/SEG/EAGE_Salt_and_Overthrust_Models) ·
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) ·
+[Original data notice](examples/salt/DATA_ATTRIBUTION.txt)
+
 ![Mean debiased soft-DTW loss over 125 accepted updates](docs/example/loss.png)
 
 ## Run the example
@@ -43,8 +53,5 @@ run with `--iterations 1`, then use `--resume` to continue to 125.
 For another misfit, pass `--misfit my_module:loss`. The function takes
 `(predicted, observed, dt, observed_rms)` and returns one scalar PyTorch loss
 per shot. Trace tensors have shape `(time, receiver, component)`.
-[Objective implementation](diffaxisem3d/objective.py)
-
-Salt model adapted from Aminzadeh, Brac and Kunz (1997), *SEG/EAGE 3-D Salt
-and Overthrust Models*. [Data attribution](examples/salt/DATA_ATTRIBUTION.txt) ·
+[Objective implementation](diffaxisem3d/objective.py) ·
 [Code license](LICENSE)
