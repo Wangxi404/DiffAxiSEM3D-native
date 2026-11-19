@@ -1,5 +1,9 @@
 # DiffAxiSEM3D-native
 
+**Authors** Xi Wang, Zhanwen Li, and Xin Liu (corresponding author)
+
+Department of Earth and Planetary Sciences, The University of Hong Kong
+
 We developed DiffAxiSEM3D-native with SeismicDiffSkill, a reusable Agent Skill
 for adapting seismic solvers for differentiable inversion. Run the salt
 inversion below or supply your own waveform misfit. PyTorch computes the
