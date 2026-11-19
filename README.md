@@ -21,8 +21,7 @@ grid from a Gaussian-smoothed initial model, holding Vs and density fixed.
 The optimizer constrains Vp to 1.45–4.70 km/s.
 
 After 125 updates, the **debiased soft-DTW divergence** (float64, γ = 0.1)
-fell from **0.00304 to 0.000423**. Vp RMSE within the simulated cylinder
-fell from **201 to 166 m/s**.
+fell from **0.00304 to 0.000423**.
 
 ![True, initial and inverted Vp in three central sections, with the survey geometry](docs/example/models.png)
 
