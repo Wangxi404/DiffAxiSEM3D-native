@@ -20,7 +20,10 @@ vertical displacement recorded at 169 receivers. We invert Vp on a 33 × 33 × 1
 grid from a Gaussian-smoothed initial model, holding Vs and density fixed.
 The optimizer constrains Vp to 1.45–4.70 km/s.
 
-After 125 updates, the **debiased soft-DTW divergence** (float64, γ = 0.1)
+We chose debiased soft-DTW divergence as the default because its time-alignment
+terms make the adjoint source difficult to derive by hand, and PyTorch lets you
+switch to another differentiable misfit without deriving a new adjoint source.
+After 125 updates, the loss (float64, γ = 0.1)
 fell from **0.00304 to 0.000423**.
 
 ![True, initial and inverted Vp in three central sections, with the survey geometry](docs/example/models.png)
